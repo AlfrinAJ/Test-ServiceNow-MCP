@@ -1,0 +1,978 @@
+var MCPDocumentationRepository = Class.create();
+
+MCPDocumentationRepository.prototype = {
+
+    MAX_PAGES: 10,
+    MAX_DEPTH: 2,
+    MAX_PAGE_CONTENT: 15000,
+    MAX_TOTAL_CONTENT: 60000,
+    MAX_CANDIDATE_DESCRIPTION: 500,
+    HTTP_TIMEOUT_MS: 20000,
+    USER_AGENT: 'ServiceNow-MCP-Intake/1.0',
+
+    SKIP_EXTENSIONS: /\.(png|jpe?g|gif|svg|webp|ico|pdf|zip|gz|tgz|tar|mp4|mov|mp3|css|js|json|xml|txt|woff2?|ttf|eot)$/i,
+
+    initialize: function() {},
+
+    // =============================================================
+    // Agent tool: Retrieve Submitted MCP Documentation
+    // =============================================================
+
+    retrievePublicDocumentation: function(documentationUrl) {
+        var result = this._newResult();
+
+        try {
+            var crawl = this.crawlDocumentation(documentationUrl);
+
+            result.u_documentation_url = crawl.root_url;
+            result.u_hostname = crawl.hostname;
+            result.u_http_status = crawl.root_http_status;
+            result.u_failed_pages_json = JSON.stringify(crawl.failed);
+
+            if (!crawl.success) {
+                return this._fail(result, crawl.error);
+            }
+
+            var pagesOut = [];
+            var totalLength = 0;
+            var anyTruncated = false;
+
+            for (var i = 0; i < crawl.pages.length; i++) {
+                var page = crawl.pages[i];
+                var content = page.text;
+                var truncated = false;
+
+                if (content.length > this.MAX_PAGE_CONTENT) {
+                    content = content.substring(0, this.MAX_PAGE_CONTENT);
+                    truncated = true;
+                }
+
+                var remaining = this.MAX_TOTAL_CONTENT - totalLength;
+
+                if (remaining <= 0) {
+                    content = '';
+                    truncated = true;
+                } else if (content.length > remaining) {
+                    content = content.substring(0, remaining);
+                    truncated = true;
+                }
+
+                totalLength += content.length;
+
+                if (truncated) {
+                    anyTruncated = true;
+                }
+
+                pagesOut.push({
+                    u_url: page.url,
+                    u_title: page.title,
+                    u_depth: page.depth,
+                    u_content_truncated: truncated,
+                    u_content: content
+                });
+            }
+
+            var strongCount = 0;
+
+            for (var c = 0; c < crawl.candidates.length; c++) {
+                if (crawl.candidates[c].u_strength === 'strong') {
+                    strongCount++;
+                }
+            }
+
+            result.u_pages_fetched = crawl.pages.length;
+            result.u_pages_failed = crawl.failed.length;
+            result.u_candidate_count = crawl.candidates.length;
+            result.u_strong_candidate_count = strongCount;
+            result.u_no_tools_found = crawl.candidates.length === 0;
+            result.u_content_truncated = anyTruncated;
+            result.u_candidates_json = JSON.stringify(crawl.candidates);
+            result.u_pages_json = JSON.stringify(pagesOut);
+
+            result.u_success = true;
+            result.u_error_message = '';
+
+            return result;
+
+        } catch (error) {
+            return this._fail(
+                result,
+                'Unable to retrieve submitted MCP documentation: ' + error
+            );
+        }
+    },
+
+    // =============================================================
+    // Deterministic crawl and tool extraction.
+    // Used by the agent tool and by MCPToolDiscoveryRepository
+    // to verify the saved inventory.
+    // =============================================================
+
+    crawlDocumentation: function(documentationUrl) {
+        var out = {
+            success: false,
+            error: '',
+            root_url: '',
+            hostname: '',
+            base_path: '',
+            root_http_status: 0,
+            pages: [],
+            failed: [],
+            candidates: []
+        };
+
+        var rootUrl = this._normalizeUrl(
+            this._stripFragment(this._trim(documentationUrl))
+        );
+
+        if (!rootUrl) {
+            out.error = 'Documentation URL is required.';
+            return out;
+        }
+
+        var validation = this._validatePublicUrl(rootUrl);
+
+        if (!validation.success) {
+            out.error = validation.error;
+            return out;
+        }
+
+        out.root_url = rootUrl;
+        out.hostname = validation.hostname;
+        out.base_path = this._getBasePath(rootUrl);
+
+        var queue = [{
+            url: rootUrl,
+            depth: 0
+        }];
+        var queued = {};
+        queued[this._urlKey(rootUrl)] = true;
+
+        var candidateMap = {};
+        var candidateOrder = [];
+        var attempts = 0;
+
+        while (queue.length > 0 && attempts < this.MAX_PAGES) {
+            var item = queue.shift();
+            attempts++;
+
+            var fetched = this._fetch(item.url);
+
+            if (item.depth === 0) {
+                out.root_http_status = fetched.status;
+            }
+
+            if (!fetched.success) {
+                out.failed.push({
+                    u_url: item.url,
+                    u_http_status: fetched.status,
+                    u_error: fetched.error
+                });
+
+                if (item.depth === 0) {
+                    out.error = 'The documentation URL could not be retrieved: ' + fetched.error;
+                    return out;
+                }
+
+                continue;
+            }
+
+            var contentHtml = this._removeBoilerplate(fetched.body);
+
+            out.pages.push({
+                url: item.url,
+                depth: item.depth,
+                title: this._extractTitle(fetched.body),
+                text: this._cleanHtml(contentHtml)
+            });
+
+            this._mergeCandidates(
+                candidateMap,
+                candidateOrder,
+                this._extractCandidates(contentHtml, item.url)
+            );
+
+            if (item.depth < this.MAX_DEPTH) {
+                var links = this._extractToolLinks(
+                    fetched.body,
+                    item.url,
+                    out.hostname,
+                    out.base_path
+                );
+
+                for (var l = 0; l < links.length; l++) {
+                    var key = this._urlKey(links[l].url);
+
+                    if (queued[key]) {
+                        continue;
+                    }
+
+                    queued[key] = true;
+
+                    queue.push({
+                        url: links[l].url,
+                        depth: item.depth + 1
+                    });
+                }
+            }
+        }
+
+        for (var i = 0; i < candidateOrder.length; i++) {
+            out.candidates.push(candidateMap[candidateOrder[i]]);
+        }
+
+        out.success = true;
+        return out;
+    },
+
+    // =============================================================
+    // HTTP
+    // =============================================================
+
+    _fetch: function(url) {
+        var r = {
+            success: false,
+            status: 0,
+            body: '',
+            error: ''
+        };
+
+        try {
+            var request = new sn_ws.RESTMessageV2();
+            request.setHttpMethod('get');
+            request.setEndpoint(url);
+            request.setRequestHeader('Accept', 'text/html,application/xhtml+xml,text/plain');
+            request.setRequestHeader('User-Agent', this.USER_AGENT);
+            request.setHttpTimeout(this.HTTP_TIMEOUT_MS);
+
+            var response = request.execute();
+            r.status = response.getStatusCode();
+
+            if (r.status < 200 || r.status >= 300) {
+                var errorMessage = '';
+
+                try {
+                    errorMessage = response.getErrorMessage() || '';
+                } catch (ignore) {}
+
+                r.error = 'HTTP status ' + r.status + (errorMessage ? ' - ' + errorMessage : '');
+                return r;
+            }
+
+            var contentType = ('' + (response.getHeader('Content-Type') || '')).toLowerCase();
+
+            if (
+                contentType &&
+                contentType.indexOf('html') === -1 &&
+                contentType.indexOf('text') === -1
+            ) {
+                r.error = 'Unsupported content type: ' + contentType;
+                return r;
+            }
+
+            r.body = '' + (response.getBody() || '');
+
+            if (!r.body) {
+                r.error = 'The page returned an empty response.';
+                return r;
+            }
+
+            r.success = true;
+            return r;
+
+        } catch (error) {
+            r.error = '' + error;
+            return r;
+        }
+    },
+
+    // =============================================================
+    // Link following: same host, under the documentation base path,
+    // and only links that point to tool content
+    // =============================================================
+
+    _extractToolLinks: function(html, pageUrl, hostname, basePath) {
+        var links = [];
+        var seen = {};
+        var pageKey = this._urlKey(pageUrl);
+        // match[2] = href value, match[3] = link inner HTML
+        var anchorRe = /<a\b[^>]*?\bhref\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a>/gi;
+        var match;
+
+        while ((match = anchorRe.exec(html)) !== null) {
+            var href = this._decodeEntities(match[2]).replace(/[\u200B\u200C\u200D\uFEFF]/g, '');
+            var resolved = this._resolveUrl(pageUrl, href);
+
+            if (!resolved || /\s|</.test(resolved)) {
+                continue;
+            }
+
+            var validation = this._validatePublicUrl(resolved);
+
+            if (!validation.success || validation.hostname !== hostname) {
+                continue;
+            }
+
+            var path = this._getPath(resolved);
+
+            if (path.indexOf(basePath) !== 0 || this.SKIP_EXTENSIONS.test(path)) {
+                continue;
+            }
+
+            var key = this._urlKey(resolved);
+
+            if (seen[key] || key === pageKey) {
+                continue;
+            }
+
+            var linkText = this._toText(match[3]);
+            var before = this._toText(
+                html.substring(Math.max(0, match.index - 400), match.index)
+            );
+            before = before.substring(Math.max(0, before.length - 150));
+
+            var score = 0;
+
+            if (/tool/i.test(path)) {
+                score += 3;
+            }
+
+            if (/tool/i.test(linkText)) {
+                score += 3;
+            }
+
+            if (/tool/i.test(before)) {
+                score += 2;
+            }
+
+            if (score === 0) {
+                continue;
+            }
+
+            seen[key] = true;
+
+            links.push({
+                url: resolved,
+                score: score
+            });
+        }
+
+        links.sort(function(a, b) {
+            return b.score - a.score;
+        });
+
+        return links;
+    },
+
+    // =============================================================
+    // Tool candidate extraction
+    // =============================================================
+
+    _extractCandidates: function(html, pageUrl) {
+        var candidates = [];
+        var headings = this._collectHeadings(html);
+
+        // 1. Tables with a "Tool" column (strong)
+        var tableRe = /<table\b[\s\S]*?<\/table>/gi;
+        var tableMatch;
+
+        while ((tableMatch = tableRe.exec(html)) !== null) {
+            var rows = tableMatch[0].match(/<tr\b[\s\S]*?<\/tr>/gi) || [];
+
+            if (rows.length < 2) {
+                continue;
+            }
+
+            var headers = this._extractCells(rows[0]);
+            var toolCol = -1;
+            var descCol = -1;
+
+            for (var h = 0; h < headers.length; h++) {
+                var headerText = headers[h].toLowerCase();
+
+                if (toolCol === -1 && /\btools?\b/.test(headerText)) {
+                    toolCol = h;
+                    continue;
+                }
+
+                if (descCol === -1 && /(description|what it does|purpose|summary|details)/.test(headerText)) {
+                    descCol = h;
+                }
+            }
+
+            if (toolCol === -1) {
+                continue;
+            }
+
+            var tableSection = this._sectionLabel(headings, tableMatch.index, 4);
+
+            for (var r = 1; r < rows.length; r++) {
+                var cells = this._extractCells(rows[r]);
+
+                if (cells.length <= toolCol) {
+                    continue;
+                }
+
+                var name = this._cleanName(cells[toolCol]);
+
+                if (!this._isToolLikeName(name)) {
+                    continue;
+                }
+
+                var notes = [];
+
+                for (var c = 0; c < cells.length && c < headers.length; c++) {
+                    if (c === toolCol || c === descCol || !cells[c]) {
+                        continue;
+                    }
+
+                    var value = cells[c];
+
+                    if (value === '\u2713' || value === '\u2714') {
+                        value = 'Yes';
+                    }
+
+                    notes.push(headers[c] + ': ' + value);
+                }
+
+                candidates.push(this._candidate(
+                    name,
+                    descCol > -1 && cells.length > descCol ? cells[descCol] : '',
+                    pageUrl,
+                    'table',
+                    'strong',
+                    tableSection,
+                    notes.join('; ')
+                ));
+            }
+        }
+
+        // 2. Identifier-style headings (h2/h3 strong, h4 weak)
+        //    Section = parent headings only (strictly higher level),
+        //    so sibling tool headings never become the parent.
+        for (var i = 0; i < headings.length; i++) {
+            var heading = headings[i];
+
+            if (heading.level < 2 || heading.level > 4) {
+                continue;
+            }
+
+            var headingName = this._cleanName(heading.text);
+
+            if (!this._isToolLikeName(headingName)) {
+                continue;
+            }
+
+            candidates.push(this._candidate(
+                headingName,
+                this._descriptionAfter(html, heading.end),
+                pageUrl,
+                'heading',
+                heading.level <= 3 ? 'strong' : 'weak',
+                this._sectionLabel(headings, heading.index, heading.level),
+                ''
+            ));
+        }
+
+        // 3. List items that start with a code-formatted name (weak)
+        var listRe = /<li\b[^>]*>\s*(?:<p\b[^>]*>\s*)?<code\b[^>]*>([\s\S]*?)<\/code>([\s\S]*?)<\/li>/gi;
+        var listMatch;
+
+        while ((listMatch = listRe.exec(html)) !== null) {
+            var listName = this._cleanName(listMatch[1]);
+
+            if (!this._isToolLikeName(listName)) {
+                continue;
+            }
+
+            candidates.push(this._candidate(
+                listName,
+                this._toText(listMatch[2]).replace(/^[\s:\-\u2013\u2014]+/, ''),
+                pageUrl,
+                'code_list',
+                'weak',
+                this._sectionLabel(headings, listMatch.index, 4),
+                ''
+            ));
+        }
+
+        return candidates;
+    },
+
+    _candidate: function(name, description, url, foundIn, strength, section, notes) {
+        return {
+            u_tool_name: name,
+            u_description: this._cap(description || '', this.MAX_CANDIDATE_DESCRIPTION),
+            u_source_urls: [url],
+            u_found_in: [foundIn],
+            u_strength: strength,
+            u_section: section || '',
+            u_notes: notes || ''
+        };
+    },
+
+    _mergeCandidates: function(map, order, list) {
+        for (var i = 0; i < list.length; i++) {
+            var candidate = list[i];
+            var key = candidate.u_tool_name.toLowerCase();
+            var existing = map[key];
+
+            if (!existing) {
+                map[key] = candidate;
+                order.push(key);
+                continue;
+            }
+
+            if (candidate.u_strength === 'strong') {
+                existing.u_strength = 'strong';
+            }
+
+            this._addUnique(existing.u_source_urls, candidate.u_source_urls[0]);
+            this._addUnique(existing.u_found_in, candidate.u_found_in[0]);
+
+            if (candidate.u_description.length > existing.u_description.length) {
+                existing.u_description = candidate.u_description;
+            }
+
+            if (!existing.u_notes && candidate.u_notes) {
+                existing.u_notes = candidate.u_notes;
+            }
+
+            if (!existing.u_section && candidate.u_section) {
+                existing.u_section = candidate.u_section;
+            }
+        }
+    },
+
+    _isToolLikeName: function(name) {
+        if (!name || name.length > 100) {
+            return false;
+        }
+
+        if (!/^[A-Za-z][A-Za-z0-9_.:\/\-]*[A-Za-z0-9]$/.test(name)) {
+            return false;
+        }
+
+        // snake_case, kebab-case, dotted or namespaced
+        if (/[_\-.:\/]/.test(name)) {
+            return true;
+        }
+
+        // single lowercase word, e.g. whoami
+        if (/^[a-z][a-z0-9]*$/.test(name)) {
+            return true;
+        }
+
+        // camelCase
+        if (/[a-z][A-Z]/.test(name)) {
+            return true;
+        }
+
+        return false;
+    },
+
+    _cleanName: function(value) {
+        return this._toText(value)
+            .replace(/[`'"]/g, '')
+            .replace(/^#+|#+$/g, '')
+            .replace(/\(\)$/, '')
+            .trim();
+    },
+
+    _collectHeadings: function(html) {
+        var list = [];
+        var re = /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi;
+        var match;
+
+        while ((match = re.exec(html)) !== null) {
+            list.push({
+                index: match.index,
+                end: match.index + match[0].length,
+                level: parseInt(match[1], 10),
+                text: this._toText(match[2]).replace(/^#+|#+$/g, '').trim()
+            });
+        }
+
+        return list;
+    },
+
+    // Builds "H2 > H3" from headings before `index`.
+    // Only headings with level < maxLevel are considered parents.
+    //   - heading candidates pass their own level (h3 tool -> h2 only)
+    //   - tables / code lists pass 4 (h2 and h3)
+    _sectionLabel: function(headings, index) {
+        var h2 = '';
+        var h3 = '';
+
+        for (var i = 0; i < headings.length; i++) {
+            var heading = headings[i];
+
+            if (heading.index >= index) {
+                break;
+            }
+
+            // Tool-name headings are not section labels
+            if (this._isToolLikeName(this._cleanName(heading.text))) {
+                continue;
+            }
+
+            if (heading.level <= 2) {
+                h2 = heading.text;
+                h3 = '';
+            } else if (heading.level === 3) {
+                h3 = heading.text;
+            }
+        }
+
+        if (h2 && h3) {
+            return h2 + ' > ' + h3;
+        }
+
+        return h3 || h2;
+    },
+
+    _descriptionAfter: function(html, start) {
+        var segment = html.substring(start, start + 6000);
+        var next = segment.search(/<h[1-6]\b/i);
+
+        if (next > -1) {
+            segment = segment.substring(0, next);
+        }
+
+        var paragraphs = segment.match(/<p\b[^>]*>[\s\S]*?<\/p>/gi) || [];
+        var texts = [];
+
+        for (var i = 0; i < paragraphs.length && texts.length < 2; i++) {
+            var text = this._toText(paragraphs[i]);
+
+            if (!text || /^supported file types/i.test(text)) {
+                continue;
+            }
+
+            texts.push(text);
+        }
+
+        return this._cap(texts.join(' '), this.MAX_CANDIDATE_DESCRIPTION);
+    },
+
+    _extractCells: function(rowHtml) {
+        var cells = [];
+        var re = /<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/gi;
+        var match;
+
+        while ((match = re.exec(rowHtml)) !== null) {
+            cells.push(this._toText(match[1]));
+        }
+
+        return cells;
+    },
+
+    // =============================================================
+    // HTML to text
+    // =============================================================
+
+    _removeBoilerplate: function(html) {
+        var s = '' + (html || '');
+        var tags = ['script', 'style', 'noscript', 'svg', 'template', 'nav', 'header', 'footer', 'aside'];
+
+        s = s.replace(/<!--[\s\S]*?-->/g, ' ');
+
+        for (var i = 0; i < tags.length; i++) {
+            s = s.replace(
+                new RegExp('<' + tags[i] + '\\b[\\s\\S]*?<\\/' + tags[i] + '>', 'gi'),
+                ' '
+            );
+        }
+
+        return s;
+    },
+
+    _cleanHtml: function(html) {
+        var s = '' + (html || '');
+
+        s = s.replace(/<h[1-6]\b[^>]*>/gi, '\n\nHEADING: ');
+        s = s.replace(/<\/h[1-6]>/gi, '\n');
+        s = s.replace(/<tr\b[^>]*>/gi, '\n');
+        s = s.replace(/<\/t[hd]>/gi, ' | ');
+        s = s.replace(/<br\s*\/?>/gi, '\n');
+        s = s.replace(/<li\b[^>]*>/gi, '\n- ');
+        s = s.replace(/<\/(p|li|div|pre|table|ul|ol|section|article)>/gi, '\n');
+        s = s.replace(/<[^>]*>/g, ' ');
+        s = this._decodeEntities(s);
+        s = s.replace(/[\u200B\u200C\u200D\uFEFF]/g, '');
+        s = s.replace(/\r/g, '');
+        s = s.replace(/[ \t]+/g, ' ');
+        s = s.replace(/ *\n */g, '\n');
+        s = s.replace(/\n{3,}/g, '\n\n');
+
+        return s.trim();
+    },
+
+    _toText: function(html) {
+        var s = '' + (html || '');
+
+        s = s.replace(/<br\s*\/?>/gi, ' ');
+        s = s.replace(/<[^>]*>/g, ' ');
+        s = this._decodeEntities(s);
+        s = s.replace(/[\u200B\u200C\u200D\uFEFF]/g, '');
+        s = s.replace(/\s+/g, ' ');
+
+        return s.trim();
+    },
+
+    _decodeEntities: function(value) {
+        var s = '' + (value || '');
+
+        s = s.replace(/&#(\d+);/g, function(m, dec) {
+            return String.fromCharCode(parseInt(dec, 10));
+        });
+
+        s = s.replace(/&#x([0-9a-f]+);/gi, function(m, hex) {
+            return String.fromCharCode(parseInt(hex, 16));
+        });
+
+        s = s.replace(/&nbsp;/gi, ' ');
+        s = s.replace(/&lt;/gi, '<');
+        s = s.replace(/&gt;/gi, '>');
+        s = s.replace(/&quot;/gi, '"');
+        s = s.replace(/&apos;/gi, "'");
+        s = s.replace(/&amp;/gi, '&');
+
+        return s;
+    },
+
+    _extractTitle: function(html) {
+        var match = ('' + (html || '')).match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+        return match ? this._toText(match[1]) : '';
+    },
+
+    // =============================================================
+    // URL helpers
+    // =============================================================
+
+    _validatePublicUrl: function(url) {
+        var match = ('' + (url || '')).match(/^https:\/\/([^\/?#:]+)(?::(\d+))?(?:[\/?#]|$)/i);
+
+        if (!match) {
+            return {
+                success: false,
+                error: 'Documentation URL must be a valid public HTTPS URL.'
+            };
+        }
+
+        var hostname = match[1].toLowerCase();
+
+        if (
+            hostname === 'localhost' ||
+            hostname === '0.0.0.0' ||
+            /\.(local|internal|localhost)$/.test(hostname)
+        ) {
+            return {
+                success: false,
+                error: 'Private or local documentation URLs are not permitted.'
+            };
+        }
+
+        if (
+            /^127\./.test(hostname) ||
+            /^10\./.test(hostname) ||
+            /^192\.168\./.test(hostname) ||
+            /^169\.254\./.test(hostname) ||
+            /^172\.(1[6-9]|2\d|3[01])\./.test(hostname)
+        ) {
+            return {
+                success: false,
+                error: 'Private network documentation URLs are not permitted.'
+            };
+        }
+
+        if (hostname.indexOf('.') === -1) {
+            return {
+                success: false,
+                error: 'Documentation URL must use a fully qualified public host name.'
+            };
+        }
+
+        return {
+            success: true,
+            hostname: hostname
+        };
+    },
+
+    _resolveUrl: function(baseUrl, href) {
+        href = this._trim(href)
+            .replace(/[\u200B\u200C\u200D\uFEFF]/g, '')
+            .replace(/&amp;/gi, '&')
+            .trim();
+
+        if (!href || href.charAt(0) === '#') {
+            return '';
+        }
+
+        // Reject anything that is not a clean URL token
+        if (/[\s<>"'`{}|\\^]/.test(href)) {
+            return '';
+        }
+
+        if (/^(mailto|javascript|tel|data|ftp):/i.test(href)) {
+            return '';
+        }
+
+        var cut = href.search(/[?#]/);
+
+        if (cut > -1) {
+            href = href.substring(0, cut);
+        }
+
+        if (!href || /^http:\/\//i.test(href)) {
+            return '';
+        }
+
+        if (/^https:\/\//i.test(href)) {
+            return this._normalizeUrl(href);
+        }
+
+        if (href.indexOf('//') === 0) {
+            return this._normalizeUrl('https:' + href);
+        }
+
+        var originMatch = baseUrl.match(/^(https:\/\/[^\/?#]+)/i);
+
+        if (!originMatch) {
+            return '';
+        }
+
+        var path;
+
+        if (href.charAt(0) === '/') {
+            path = href;
+        } else {
+            var basePath = this._getPath(baseUrl);
+            path = basePath.substring(0, basePath.lastIndexOf('/') + 1) + href;
+        }
+
+        return this._normalizeUrl(originMatch[1] + this._normalizePath(path));
+    },
+
+    _normalizePath: function(path) {
+        var trailing = /\/$/.test(path);
+        var segments = path.split('/');
+        var out = [];
+
+        for (var i = 0; i < segments.length; i++) {
+            var segment = segments[i];
+
+            if (segment === '' || segment === '.') {
+                continue;
+            }
+
+            if (segment === '..') {
+                if (out.length) {
+                    out.pop();
+                }
+                continue;
+            }
+
+            out.push(segment);
+        }
+
+        var result = '/' + out.join('/');
+
+        if (trailing && result !== '/') {
+            result += '/';
+        }
+
+        return result;
+    },
+
+    _getPath: function(url) {
+        var match = ('' + (url || '')).match(/^https?:\/\/[^\/?#]+([^?#]*)/i);
+        return match && match[1] ? match[1] : '/';
+    },
+
+    // Parent directory of the submitted page.
+    // /docs/figma-mcp-server/tools-and-prompts/ -> /docs/figma-mcp-server/
+    _getBasePath: function(url) {
+        var trimmed = this._getPath(url).replace(/\/+$/, '');
+        var index = trimmed.lastIndexOf('/');
+
+        if (index <= 0) {
+            return '/';
+        }
+
+        return trimmed.substring(0, index + 1);
+    },
+
+    _normalizeUrl: function(url) {
+        url = this._trim(url);
+
+        var match = url.match(/^(https?):\/\/([^\/?#]+)(.*)$/i);
+
+        if (!match) {
+            return url;
+        }
+
+        return match[1].toLowerCase() + '://' + match[2].toLowerCase() + (match[3] || '');
+    },
+
+    _stripFragment: function(url) {
+        var index = ('' + (url || '')).indexOf('#');
+        return index > -1 ? url.substring(0, index) : url;
+    },
+
+    _urlKey: function(url) {
+        return this._normalizeUrl(this._stripFragment(url))
+            .toLowerCase()
+            .replace(/\/+$/, '');
+    },
+
+    // =============================================================
+    // General helpers
+    // =============================================================
+
+    _addUnique: function(list, value) {
+        if (value && list.indexOf(value) === -1) {
+            list.push(value);
+        }
+    },
+
+    _cap: function(text, max) {
+        text = '' + (text || '');
+        return text.length > max ? text.substring(0, max - 3) + '...' : text;
+    },
+
+    _trim: function(value) {
+        if (value === undefined || value === null) {
+            return '';
+        }
+
+        return ('' + value).trim();
+    },
+
+    _newResult: function() {
+        return {
+            u_success: false,
+            u_error_message: '',
+            u_documentation_url: '',
+            u_hostname: '',
+            u_http_status: 0,
+            u_pages_fetched: 0,
+            u_pages_failed: 0,
+            u_candidate_count: 0,
+            u_strong_candidate_count: 0,
+            u_no_tools_found: true,
+            u_content_truncated: false,
+            u_candidates_json: '[]',
+            u_pages_json: '[]',
+            u_failed_pages_json: '[]'
+        };
+    },
+
+    _fail: function(result, errorMessage) {
+        result.u_success = false;
+        result.u_error_message = errorMessage;
+        return result;
+    },
+
+    type: 'MCPDocumentationRepository'
+};
